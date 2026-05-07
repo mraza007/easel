@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "easel": {
+      "command": "node",
+      "args": ["./mcp-server/dist/index.js"],
+      "env": {
+        "EASEL_PROJECT_ROOT": "."
+      }
+    }
+  }
+}

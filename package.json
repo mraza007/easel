@@ -1,0 +1,19 @@
+{
+  "name": "easel",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Open-source visual canvas for AI coding agents. Designs on canvas; agents read via MCP and translate to React, using your existing design system.",
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "canvas": "pnpm --filter @easel/app dev",
+    "mcp": "pnpm --filter @easel/mcp-server dev",
+    "setup": "pnpm install && pnpm --filter @easel/ds-scanner build && pnpm --filter @easel/mcp-server build",
+    "install:cursor": "node scripts/install-cursor.mjs"
+  },
+  "packageManager": "pnpm@8.6.5",
+  "engines": {
+    "node": ">=20"
+  }
+}

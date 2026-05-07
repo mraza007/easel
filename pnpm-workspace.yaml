@@ -1,0 +1,4 @@
+packages:
+  - "app"
+  - "mcp-server"
+  - "ds-scanner"

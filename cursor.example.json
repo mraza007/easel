@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "easel": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/easel/mcp-server/dist/index.js"],
+      "env": {
+        "EASEL_PROJECT_ROOT": "/absolute/path/to/your/react/project"
+      }
+    }
+  }
+}
