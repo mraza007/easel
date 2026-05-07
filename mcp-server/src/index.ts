@@ -55,6 +55,10 @@ const SetTextArgs = z.object({ nodeId: z.string(), text: z.string() });
 const SetLayerNameArgs = z.object({ nodeId: z.string(), layerName: z.string() });
 const SetDocumentNameArgs = z.object({ name: z.string() });
 const DuplicateArtboardArgs = z.object({ nodeId: z.string() });
+const DesignToCodeArgs = z.object({
+  nodeId: z.string(),
+  framework: z.enum(["react", "vue", "svelte"]).optional(),
+});
 
 const GetComputedStylesArgs = z.object({
   nodeId: z.string(),
@@ -267,6 +271,26 @@ const tools = [
       required: ["nodeId"],
       properties: {
         nodeId: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "design_to_code",
+    description:
+      "Translate a design subtree to production code. Returns a screenshot, the design's JSX, root computed styles, the project's design-system summary, and a translation brief. Use this INSTEAD of stitching together get_jsx + get_computed_styles + get_screenshot + get_design_system. After receiving it, write the resulting component to the user's repo using your own file-editing tools — do not return code in chat.",
+    inputSchema: {
+      type: "object",
+      required: ["nodeId"],
+      properties: {
+        nodeId: {
+          type: "string",
+          description: "The artboard or subtree to translate. Usually an artboard id from get_basic_info.",
+        },
+        framework: {
+          type: "string",
+          enum: ["react", "vue", "svelte"],
+          description: "Target framework. Defaults to whatever ds-scanner detected from the project's package.json.",
+        },
       },
     },
   },
@@ -498,9 +522,161 @@ async function dispatch(
       });
     }
 
+    case "design_to_code": {
+      const a = DesignToCodeArgs.parse(args);
+      const node = canvas.findNode(a.nodeId);
+      if (!node) throw new Error(`Node not found: ${a.nodeId}`);
+      if (!designSystem) await refreshDS();
+
+      const jsx = emitJsx(node);
+      const detected = designSystem?.framework;
+      const framework =
+        a.framework ?? (detected && detected !== "unknown" ? detected : "react");
+
+      let computedStyles: Record<string, string> | null = null;
+      try {
+        computedStyles = await rpc.call<Record<string, string>>(
+          "get_computed_styles",
+          { nodeId: a.nodeId },
+          5000,
+        );
+      } catch {
+        // Canvas may be disconnected; fall back to authored styles only.
+      }
+
+      let shot: { mimeType: string; data: string; width: number; height: number } | null =
+        null;
+      try {
+        shot = await rpc.call(
+          "get_screenshot",
+          { nodeId: a.nodeId, scale: 1 },
+          15000,
+        );
+      } catch {
+        // No canvas — proceed without visual reference.
+      }
+
+      const dsSummary = designSystem
+        ? {
+            framework: designSystem.framework,
+            tailwindConfigPath: designSystem.styling.tailwindConfigPath,
+            cssEntryPaths: designSystem.styling.cssEntryPaths,
+            customProperties: designSystem.styling.customProperties,
+            componentCount: designSystem.components.length,
+            components: designSystem.components.slice(0, 30).map((c) => ({
+              name: c.name,
+              file: c.filePath,
+              exportType: c.exportType,
+            })),
+          }
+        : null;
+
+      const brief = buildDesignBrief({
+        nodeId: a.nodeId,
+        layerName: node.layerName,
+        framework,
+        jsx,
+        computedStyles,
+        designSystem: dsSummary,
+        hasScreenshot: shot !== null,
+      });
+
+      const content: Content[] = [];
+      if (shot) {
+        content.push({ type: "image", data: shot.data, mimeType: shot.mimeType });
+      }
+      content.push({ type: "text", text: brief });
+      return content;
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
+}
+
+interface BriefInput {
+  nodeId: string;
+  layerName: string | undefined;
+  framework: string;
+  jsx: string;
+  computedStyles: Record<string, string> | null;
+  designSystem: unknown;
+  hasScreenshot: boolean;
+}
+
+function buildDesignBrief(b: BriefInput): string {
+  const lines: string[] = [];
+  lines.push(`# Design → ${b.framework} translation`);
+  lines.push("");
+  lines.push(
+    `Translating **${b.layerName ?? b.nodeId}** to production code in the user's repo.`,
+  );
+  lines.push("");
+  lines.push("## How to translate");
+  lines.push("");
+  lines.push(
+    "1. **Match conventions.** Read the project's existing components and adopt the same style (Tailwind classes vs inline, CSS modules vs CSS-in-JS, named vs default exports, file naming). Don't introduce a new pattern.",
+  );
+  lines.push(
+    "2. **Use the design system.** Where the design has a hex color, font size, or spacing value, look for a matching token in the design-system summary below and prefer the token. If the design has a button that looks like the project's existing `<Button>`, use it — don't reimplement.",
+  );
+  lines.push(
+    "3. **Pick component boundaries thoughtfully.** Don't translate as a single monolithic block. Break out cards, sections, and repeated patterns into reusable child components.",
+  );
+  lines.push(
+    "4. **Match intent, not pixels.** If the design uses `14px` and the project uses Tailwind's `text-sm`, use the class. Round to nearest token where reasonable.",
+  );
+  lines.push(
+    "5. **Write the code.** Use your file-editing tools to create the file(s) in the user's project. Do NOT return code in chat — write it to disk.",
+  );
+  lines.push(
+    "6. **Tell the user where you put it.** After writing, briefly summarize the files you created and any follow-up they should run (e.g., `pnpm install` if you added a dep).",
+  );
+  lines.push("");
+  if (b.hasScreenshot) {
+    lines.push(
+      "The screenshot above shows what the user sees on the canvas. Refer to it for spatial intent, alignment, and visual hierarchy that JSX alone might not convey.",
+    );
+    lines.push("");
+  }
+  lines.push("## Design tree");
+  lines.push("");
+  lines.push("```jsx");
+  lines.push(b.jsx);
+  lines.push("```");
+  lines.push("");
+  lines.push("## Computed styles (root node)");
+  lines.push("");
+  if (b.computedStyles) {
+    lines.push("```json");
+    lines.push(JSON.stringify(b.computedStyles, null, 2));
+    lines.push("```");
+    lines.push("");
+    lines.push(
+      "For descendants, call `get_computed_styles` per-node — the design tree above lists every `data-easel-id` you can pass.",
+    );
+  } else {
+    lines.push(
+      "_(canvas not connected — call `get_computed_styles` once it is, or rely on authored styles in the JSX above)_",
+    );
+  }
+  lines.push("");
+  lines.push("## Design system");
+  lines.push("");
+  if (b.designSystem) {
+    lines.push("```json");
+    lines.push(JSON.stringify(b.designSystem, null, 2));
+    lines.push("```");
+    lines.push("");
+    lines.push(
+      "Read the listed component files before generating to confirm props, variants, and import paths.",
+    );
+  } else {
+    lines.push(
+      "_(no design system detected — generate plain HTML/CSS or inline styles and let the user wire to their tokens)_",
+    );
+  }
+  return lines.join("\n");
 }
 
 function buildBasicInfo() {
