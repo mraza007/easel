@@ -11,6 +11,8 @@ import { SEED_ARTBOARDS } from "./sample.js";
 import { startBridge } from "./ws-bridge.js";
 import { parseHtmlFragment, parseStyle } from "./html-parser.js";
 import { emitJsx } from "./jsx-emit.js";
+import { diffTrees } from "./diff.js";
+import { bundleComponent } from "./component-bundler.js";
 import { rpc } from "./rpc.js";
 import { loadIfExists, startAutosave } from "./persistence.js";
 import { scanProject, type DesignSystem } from "@easel/ds-scanner";
@@ -48,6 +50,10 @@ const UpdateStylesArgs = z.object({
 });
 
 const GetJsxArgs = z.object({ nodeId: z.string() });
+const GetTreeArgs = z.object({
+  nodeId: z.string().optional(),
+  depth: z.number().int().min(1).max(10).default(3),
+});
 const GetNodeInfoArgs = z.object({ nodeId: z.string() });
 const DeleteNodeArgs = z.object({ nodeId: z.string() });
 const SetSelectionArgs = z.object({ nodeId: z.string().nullable() });
@@ -55,6 +61,39 @@ const SetTextArgs = z.object({ nodeId: z.string(), text: z.string() });
 const SetLayerNameArgs = z.object({ nodeId: z.string(), layerName: z.string() });
 const SetDocumentNameArgs = z.object({ name: z.string() });
 const DuplicateArtboardArgs = z.object({ nodeId: z.string() });
+const ApplyTokenArgs = z.object({
+  nodeIds: z.array(z.string()).min(1),
+  property: z.string().describe("camelCased CSS property, e.g. backgroundColor"),
+  token: z.string().describe("custom-property name without the leading --"),
+});
+const MoveArtboardArgs = z.object({
+  nodeId: z.string(),
+  x: z.number(),
+  y: z.number(),
+});
+const DiffArtboardsArgs = z.object({ nodeIdA: z.string(), nodeIdB: z.string() });
+const CreateVariantArgs = z.object({
+  nodeId: z.string(),
+  width: z.number().int().min(120).max(3840),
+  breakpoint: z.string().optional(),
+});
+const GetVariantsArgs = z.object({ nodeId: z.string() });
+const AddCommentArgs = z.object({
+  nodeId: z.string(),
+  text: z.string().min(1),
+});
+const GetCommentsArgs = z.object({
+  nodeId: z.string().optional(),
+  includeResolved: z.boolean().default(false),
+});
+const ResolveCommentArgs = z.object({ id: z.string() });
+const InsertComponentArgs = z.object({
+  targetNodeId: z.string(),
+  component: z.string(),
+  props: z.record(z.unknown()).default({}),
+  width: z.number().optional(),
+  height: z.number().optional(),
+});
 const DesignToCodeArgs = z.object({
   nodeId: z.string(),
   framework: z.enum(["react", "vue", "svelte"]).optional(),
@@ -142,6 +181,18 @@ const tools = [
       type: "object",
       required: ["nodeId"],
       properties: { nodeId: { type: "string" } },
+    },
+  },
+  {
+    name: "get_tree",
+    description:
+      "Compact indented outline of the canvas tree (id, tag, layer name, text preview) — one line per node. Far cheaper than get_jsx for orientation; use it to find node ids before targeted reads or writes. Omit nodeId for all artboards.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        nodeId: { type: "string", description: "Subtree root. Defaults to the whole canvas." },
+        depth: { type: "number", description: "Max depth (1-10). Default 3." },
+      },
     },
   },
   {
@@ -275,6 +326,133 @@ const tools = [
     },
   },
   {
+    name: "apply_token",
+    description:
+      "Set a style property to a design-system token: styles[property] = var(--token). Validates the token against the scanned design system, so prefer this over update_styles with raw values when a token matches the intent.",
+    inputSchema: {
+      type: "object",
+      required: ["nodeIds", "property", "token"],
+      properties: {
+        nodeIds: { type: "array", items: { type: "string" } },
+        property: { type: "string", description: "camelCased CSS property" },
+        token: {
+          type: "string",
+          description: "Token name without the leading --. See get_design_system.",
+        },
+      },
+    },
+  },
+  {
+    name: "move_artboard",
+    description: "Reposition a top-level artboard on the canvas (world coordinates).",
+    inputSchema: {
+      type: "object",
+      required: ["nodeId", "x", "y"],
+      properties: {
+        nodeId: { type: "string" },
+        x: { type: "number" },
+        y: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "undo",
+    description:
+      "Undo the last canvas mutation (yours or the user's). Returns remaining history depth.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "redo",
+    description: "Redo the most recently undone canvas mutation.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "diff_artboards",
+    description:
+      "Structured diff between two subtrees (usually artboards): added/removed nodes and per-node style/text/tag changes. Use to compare design iterations or check variant drift.",
+    inputSchema: {
+      type: "object",
+      required: ["nodeIdA", "nodeIdB"],
+      properties: {
+        nodeIdA: { type: "string", description: "Baseline subtree" },
+        nodeIdB: { type: "string", description: "Comparison subtree" },
+      },
+    },
+  },
+  {
+    name: "create_variant",
+    description:
+      "Clone an artboard as a linked responsive variant at a given width (e.g. 375 for mobile). The clone keeps content but you should then adapt its layout. Variants stay linked via variantOf for get_variants/diff_artboards.",
+    inputSchema: {
+      type: "object",
+      required: ["nodeId", "width"],
+      properties: {
+        nodeId: { type: "string" },
+        width: { type: "number", description: "Variant width in px" },
+        breakpoint: { type: "string", description: "Label, e.g. 'mobile'. Defaults to the width." },
+      },
+    },
+  },
+  {
+    name: "get_variants",
+    description: "List the variant group an artboard belongs to (base + all linked variants).",
+    inputSchema: {
+      type: "object",
+      required: ["nodeId"],
+      properties: { nodeId: { type: "string" } },
+    },
+  },
+  {
+    name: "add_comment",
+    description:
+      "Pin a comment to a node on the canvas — use to explain non-obvious choices ('matched your text-sm token here') or ask the user a question. Users see pins and can reply; poll get_comments for replies.",
+    inputSchema: {
+      type: "object",
+      required: ["nodeId", "text"],
+      properties: {
+        nodeId: { type: "string" },
+        text: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "get_comments",
+    description:
+      "List canvas comments (agent + user), newest last. Filter by nodeId; resolved comments are hidden unless includeResolved.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        nodeId: { type: "string" },
+        includeResolved: { type: "boolean" },
+      },
+    },
+  },
+  {
+    name: "resolve_comment",
+    description: "Mark a comment as resolved (e.g. after addressing the user's feedback).",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: { id: { type: "string" } },
+    },
+  },
+  {
+    name: "insert_component",
+    description:
+      "Insert one of the project's REAL components (from get_design_system) onto the canvas. The canvas bundles the actual source with the project's own react and renders it in a sandboxed iframe — what you see is the real component. Props must be JSON-serializable. Note: CSS imports are stubbed; Tailwind-styled components render unstyled in v1.",
+    inputSchema: {
+      type: "object",
+      required: ["targetNodeId", "component"],
+      properties: {
+        targetNodeId: { type: "string" },
+        component: { type: "string", description: "Component name from get_design_system" },
+        props: { type: "object", description: "JSON-serializable props" },
+        width: { type: "number", description: "Frame width px (default 320)" },
+        height: { type: "number", description: "Frame height px (default 120)" },
+      },
+    },
+  },
+  {
     name: "design_to_code",
     description:
       "Translate a design subtree to production code. Returns a screenshot, the design's JSX, root computed styles, the project's design-system summary, and a translation brief. Use this INSTEAD of stitching together get_jsx + get_computed_styles + get_screenshot + get_design_system. After receiving it, write the resulting component to the user's repo using your own file-editing tools — do not return code in chat.",
@@ -301,10 +479,18 @@ async function main() {
   await refreshDS();
   const loaded = await loadIfExists();
   if (!loaded && canvas.getArtboards().length === 0) {
-    canvas.setArtboards(SEED_ARTBOARDS);
+    canvas.setArtboards(SEED_ARTBOARDS, { clearHistory: true });
   }
   startAutosave();
-  startBridge();
+  await startBridge({
+    getDesignSystem: () => dsSummaryForCanvas(),
+    bundleComponent: async (name, props) => {
+      if (!designSystem) await refreshDS();
+      const entry = designSystem?.components.find((c) => c.name === name);
+      if (!entry) return { ok: false, error: `unknown component: ${name}` };
+      return bundleComponent(PROJECT_ROOT, entry, props);
+    },
+  });
 
   const server = new Server(
     { name: "easel-mcp", version: "0.0.1" },
@@ -335,7 +521,9 @@ type Content = TextContent | ImageContent;
 const text = (value: unknown): Content[] => [
   {
     type: "text",
-    text: typeof value === "string" ? value : JSON.stringify(value, null, 2),
+    // Compact JSON: tool results go straight into the agent's context, and
+    // pretty-printing roughly doubles the token cost of large trees.
+    text: typeof value === "string" ? value : JSON.stringify(value),
   },
 ];
 
@@ -390,12 +578,44 @@ async function dispatch(
       const updated: string[] = [];
       const missing: string[] = [];
       for (const u of a.updates) {
-        for (const id of u.nodeIds) {
-          if (canvas.updateStyles(id, u.styles)) updated.push(id);
-          else missing.push(id);
-        }
+        const r = canvas.updateStylesMany(u.nodeIds, u.styles);
+        updated.push(...r.updated);
+        missing.push(...r.missing);
       }
       return text({ updated, missing });
+    }
+
+    case "apply_token": {
+      const a = ApplyTokenArgs.parse(args);
+      if (!designSystem) await refreshDS();
+      const name = a.token.replace(/^--/, "");
+      const known = designSystem?.styling.customProperties ?? {};
+      if (!(name in known)) {
+        const sample = Object.keys(known).slice(0, 20).join(", ") || "(none scanned)";
+        throw new Error(`Unknown token "${name}". Known tokens include: ${sample}`);
+      }
+      const r = canvas.updateStylesMany(a.nodeIds, {
+        [a.property]: `var(--${name})`,
+      });
+      return text({ ...r, applied: `var(--${name})`, value: known[name] });
+    }
+
+    case "move_artboard": {
+      const a = MoveArtboardArgs.parse(args);
+      if (!canvas.moveArtboard(a.nodeId, a.x, a.y)) {
+        throw new Error(`Artboard not found: ${a.nodeId}`);
+      }
+      return text({ ok: true, nodeId: a.nodeId, x: a.x, y: a.y });
+    }
+
+    case "undo": {
+      const ok = canvas.undo();
+      return text({ ok, ...canvas.historyDepth() });
+    }
+
+    case "redo": {
+      const ok = canvas.redo();
+      return text({ ok, ...canvas.historyDepth() });
     }
 
     case "get_jsx": {
@@ -403,6 +623,20 @@ async function dispatch(
       const node = canvas.findNode(a.nodeId);
       if (!node) throw new Error(`Node not found: ${a.nodeId}`);
       return text(emitJsx(node));
+    }
+
+    case "get_tree": {
+      const a = GetTreeArgs.parse(args);
+      let roots: PaperNode[];
+      if (a.nodeId) {
+        const node = canvas.findNode(a.nodeId);
+        if (!node) throw new Error(`Node not found: ${a.nodeId}`);
+        roots = [node];
+      } else {
+        roots = canvas.getArtboards();
+      }
+      const lines = roots.flatMap((r) => outlineNode(r, 0, a.depth));
+      return text(lines.join("\n") || "(canvas is empty)");
     }
 
     case "get_node_info": {
@@ -519,6 +753,121 @@ async function dispatch(
         layerName: ab.layerName,
         x: ab.x,
         y: ab.y,
+      });
+    }
+
+    case "diff_artboards": {
+      const a = DiffArtboardsArgs.parse(args);
+      const nodeA = canvas.findNode(a.nodeIdA);
+      const nodeB = canvas.findNode(a.nodeIdB);
+      if (!nodeA) throw new Error(`Node not found: ${a.nodeIdA}`);
+      if (!nodeB) throw new Error(`Node not found: ${a.nodeIdB}`);
+      const diffs = diffTrees(nodeA, nodeB);
+      return text({ changes: diffs.length, diffs });
+    }
+
+    case "create_variant": {
+      const a = CreateVariantArgs.parse(args);
+      const base = canvas.getArtboards().find((ab) => ab.id === a.nodeId);
+      if (!base) throw new Error(`Artboard not found: ${a.nodeId}`);
+      const clone = canvas.duplicateArtboard(a.nodeId);
+      if (!clone) throw new Error(`Artboard not found: ${a.nodeId}`);
+      const breakpoint = a.breakpoint ?? String(a.width);
+      // Root of a variant group is the base itself (follow existing links).
+      const rootId = base.variantOf ?? base.id;
+      const updated: Artboard = {
+        ...clone,
+        variantOf: rootId,
+        breakpoint,
+        layerName: `${(base.layerName ?? "Artboard").split(" / ")[0]} / ${breakpoint}`,
+        styles: { ...(clone.styles ?? {}), width: `${a.width}px` },
+      };
+      canvas.upsertArtboard(updated);
+      canvas.setSelection(updated.id);
+      return text({
+        id: updated.id,
+        layerName: updated.layerName,
+        breakpoint,
+        variantOf: rootId,
+        note: "Content was cloned as-is; adapt the layout for this width, then diff_artboards against the base to review.",
+      });
+    }
+
+    case "get_variants": {
+      const a = GetVariantsArgs.parse(args);
+      const all = canvas.getArtboards();
+      const target = all.find((ab) => ab.id === a.nodeId);
+      if (!target) throw new Error(`Artboard not found: ${a.nodeId}`);
+      const rootId = target.variantOf ?? target.id;
+      const group = all.filter((ab) => ab.id === rootId || ab.variantOf === rootId);
+      return text({
+        base: rootId,
+        variants: group.map((ab) => ({
+          id: ab.id,
+          layerName: ab.layerName,
+          breakpoint: ab.breakpoint ?? (ab.id === rootId ? "base" : undefined),
+          width: ab.styles?.width,
+        })),
+      });
+    }
+
+    case "add_comment": {
+      const a = AddCommentArgs.parse(args);
+      if (!canvas.findNode(a.nodeId)) throw new Error(`Node not found: ${a.nodeId}`);
+      const comment = canvas.addComment({
+        nodeId: a.nodeId,
+        author: "agent",
+        text: a.text,
+      });
+      return text({ ok: true, id: comment.id });
+    }
+
+    case "get_comments": {
+      const a = GetCommentsArgs.parse(args);
+      const comments = canvas
+        .getComments(a.nodeId)
+        .filter((c) => a.includeResolved || !c.resolved);
+      return text({ count: comments.length, comments });
+    }
+
+    case "resolve_comment": {
+      const a = ResolveCommentArgs.parse(args);
+      if (!canvas.resolveComment(a.id)) throw new Error(`Comment not found: ${a.id}`);
+      return text({ ok: true });
+    }
+
+    case "insert_component": {
+      const a = InsertComponentArgs.parse(args);
+      if (!canvas.findNode(a.targetNodeId)) {
+        throw new Error(`Node not found: ${a.targetNodeId}`);
+      }
+      if (!designSystem) await refreshDS();
+      const entry = designSystem?.components.find((c) => c.name === a.component);
+      if (!entry) {
+        const known = (designSystem?.components ?? []).slice(0, 20).map((c) => c.name);
+        throw new Error(
+          `Unknown component "${a.component}". Known: ${known.join(", ") || "(none)"}`,
+        );
+      }
+      const node: PaperNode = {
+        id: canvas.nextId("cmp"),
+        tag: "component",
+        layerName: a.component,
+        styles: {
+          width: `${a.width ?? 320}px`,
+          height: `${a.height ?? 120}px`,
+          display: "inline-block",
+        },
+        attrs: {
+          component: a.component,
+          props: JSON.stringify(a.props),
+        },
+      };
+      canvas.appendChildren(a.targetNodeId, [node]);
+      return text({
+        ok: true,
+        id: node.id,
+        note: "Rendered in a sandbox iframe from the project's real source. CSS imports are stubbed in v1 — Tailwind-styled components appear unstyled.",
       });
     }
 
@@ -698,6 +1047,44 @@ function buildBasicInfo() {
           componentCount: designSystem.components.length,
         }
       : null,
+  };
+}
+
+/**
+ * One line per node: `id <tag> "layer name" — text preview`. Children beyond
+ * maxDepth collapse to a count so large trees stay cheap to read.
+ */
+function outlineNode(node: PaperNode, depth: number, maxDepth: number): string[] {
+  const pad = "  ".repeat(depth);
+  const parts = [`${pad}${node.id} <${node.tag}>`];
+  if (node.layerName) parts.push(`"${node.layerName}"`);
+  if (node.text) {
+    const t = node.text.length > 40 ? `${node.text.slice(0, 40)}…` : node.text;
+    parts.push(`— ${t}`);
+  }
+  const lines = [parts.join(" ")];
+  const kids = node.children ?? [];
+  if (kids.length === 0) return lines;
+  if (depth + 1 >= maxDepth) {
+    lines.push(`${pad}  … ${kids.length} more (raise depth or pass nodeId)`);
+    return lines;
+  }
+  for (const c of kids) lines.push(...outlineNode(c, depth + 1, maxDepth));
+  return lines;
+}
+
+/** Slim design-system payload for the canvas (tokens panel + :root injection). */
+function dsSummaryForCanvas() {
+  if (!designSystem) return null;
+  return {
+    framework: designSystem.framework,
+    customProperties: designSystem.styling.customProperties,
+    components: designSystem.components.map((c) => ({
+      name: c.name,
+      filePath: c.filePath,
+      ...(c.props ? { props: c.props } : {}),
+      ...(c.variants ? { variants: c.variants } : {}),
+    })),
   };
 }
 

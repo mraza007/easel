@@ -15,7 +15,12 @@ function generateId(prefix = "n") {
 export function parseHtmlFragment(html: string): PaperNode[] {
   const root = parse(html, {
     lowerCaseTagName: false,
-    voidTag: { tags: [], closingSlash: true },
+    // Standard void tags must be declared or the parser drops unclosed
+    // <img>/<br>/<input> nodes entirely.
+    voidTag: {
+      tags: ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"],
+      closingSlash: true,
+    },
   });
   const out: PaperNode[] = [];
   for (const child of root.childNodes) {
@@ -25,10 +30,46 @@ export function parseHtmlFragment(html: string): PaperNode[] {
   return out;
 }
 
+/**
+ * Tags the canvas will render. Anything else (script, iframe, style, object,
+ * svg, custom elements) is dropped with its subtree — write_html input comes
+ * from an agent and must not be able to execute in the canvas page.
+ */
+const ALLOWED_TAGS = new Set([
+  "a", "abbr", "address", "article", "aside", "b", "blockquote", "br",
+  "button", "caption", "code", "dd", "details", "div", "dl", "dt", "em",
+  "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+  "h4", "h5", "h6", "header", "hr", "i", "img", "input", "label", "legend",
+  "li", "main", "mark", "nav", "ol", "option", "p", "picture", "pre",
+  "section", "select", "small", "source", "span", "strong", "sub", "summary",
+  "sup", "table", "tbody", "td", "textarea", "tfoot", "th", "thead", "tr",
+  "u", "ul", "video",
+]);
+
+/** Attributes that can carry a URL — checked against dangerous schemes. */
+const URL_ATTRS = new Set(["href", "src", "poster", "action", "formaction"]);
+
+function isDangerousUrl(value: string): boolean {
+  const v = value.trim().toLowerCase();
+  return v.startsWith("javascript:") || v.startsWith("vbscript:") || v.startsWith("data:text/html");
+}
+
+function sanitizeAttrs(attrs: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(attrs)) {
+    const key = k.toLowerCase();
+    if (key.startsWith("on") || key === "srcdoc") continue;
+    if (URL_ATTRS.has(key) && isDangerousUrl(v)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 function convert(node: HtmlNode): PaperNode | null {
   if (node instanceof HTMLElement) {
-    const tag = node.rawTagName || "div";
-    const attrs = { ...node.attributes };
+    const tag = (node.rawTagName || "div").toLowerCase();
+    if (!ALLOWED_TAGS.has(tag)) return null;
+    const attrs = sanitizeAttrs(node.attributes);
     const styleAttr = attrs.style;
     delete attrs.style;
     const layerName = attrs["layer-name"];

@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { canvas } from "./state.js";
-import type { Artboard } from "./types.js";
+import type { Artboard, CanvasComment } from "./types.js";
 
 const FORMAT_VERSION = 1;
 
@@ -13,6 +13,7 @@ interface FileFormat {
   version: number;
   documentName?: string;
   artboards: Artboard[];
+  comments?: CanvasComment[];
 }
 
 export const STATE_FILE_PATH = DEFAULT_PATH;
@@ -53,9 +54,12 @@ async function applyFromDisk(filePath: string, warn: boolean): Promise<boolean> 
       return false;
     }
     if (!Array.isArray(parsed.artboards)) return false;
-    canvas.setArtboards(parsed.artboards as Artboard[]);
+    canvas.setArtboards(parsed.artboards as Artboard[], { clearHistory: true });
     if (typeof parsed.documentName === "string") {
       canvas.setDocumentName(parsed.documentName);
+    }
+    if (Array.isArray(parsed.comments)) {
+      canvas.setComments(parsed.comments as CanvasComment[]);
     }
     return true;
   } catch (err) {
@@ -95,6 +99,7 @@ export function startAutosave(filePath = DEFAULT_PATH, debounceMs = 500): () => 
       version: FORMAT_VERSION,
       documentName: canvas.getDocumentName(),
       artboards: canvas.getArtboards(),
+      comments: canvas.getComments(),
     };
     try {
       await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -118,10 +123,12 @@ export function startAutosave(filePath = DEFAULT_PATH, debounceMs = 500): () => 
 
   const unsubscribeTree = canvas.subscribe(schedule);
   const unsubscribeMeta = canvas.subscribeMetadata(schedule);
+  const unsubscribeComments = canvas.subscribeComments(schedule);
 
   return () => {
     unsubscribeTree();
     unsubscribeMeta();
+    unsubscribeComments();
     if (timer) {
       clearTimeout(timer);
       void flush();

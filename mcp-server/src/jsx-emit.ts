@@ -24,6 +24,24 @@ const VOID_TAGS = new Set([
  */
 export function emitJsx(node: PaperNode, indent = 0): string {
   const pad = "  ".repeat(indent);
+
+  // Component nodes emit real component usage — the whole point of the sandbox.
+  if (node.tag === "component" && node.attrs?.component) {
+    const name = node.attrs.component;
+    let propsStr = "";
+    try {
+      const props = JSON.parse(node.attrs.props ?? "{}") as Record<string, unknown>;
+      propsStr = Object.entries(props)
+        .map(([k, v]) =>
+          typeof v === "string" ? ` ${k}=${JSON.stringify(v)}` : ` ${k}={${JSON.stringify(v)}}`,
+        )
+        .join("");
+    } catch {
+      // Unparseable props — emit the bare component.
+    }
+    return `${pad}<${name}${propsStr} />`;
+  }
+
   const tag = node.tag === "artboard" ? "div" : node.tag;
   const styleStr = node.styles ? ` style={${formatStyleObject(node.styles)}}` : "";
   const attrStr = node.attrs ? formatAttrs(node.attrs) : "";
