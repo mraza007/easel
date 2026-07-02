@@ -21,7 +21,10 @@ export interface ComponentEntry {
   name: string;
   filePath: string;
   exportType: "default" | "named" | "unknown";
-  /** Best-effort summary; richer extraction (props, variants) comes later. */
+  /** Prop names extracted from `interface XxxProps` / `type XxxProps = {...}`. */
+  props?: string[];
+  /** cva()/tv() variant groups: { variant: ["default","destructive"], size: [...] }. */
+  variants?: Record<string, string[]>;
   summary?: string;
 }
 
@@ -42,13 +45,9 @@ const COMPONENT_DIRS = [
 
 const COMPONENT_EXTS = new Set([".tsx", ".jsx", ".vue", ".svelte"]);
 
-const CSS_ENTRY_CANDIDATES = [
-  "src/index.css",
-  "src/globals.css",
-  "src/app/globals.css",
-  "app/globals.css",
-  "styles/globals.css",
-];
+/** Directories worth walking for stylesheets; keeps the scan off vendor code. */
+const CSS_SCAN_DIRS = ["src", "app", "styles", "css"];
+const CSS_FILE_LIMIT = 40;
 
 export async function scanProject(projectRoot: string): Promise<DesignSystem> {
   const root = path.resolve(projectRoot);
@@ -56,7 +55,7 @@ export async function scanProject(projectRoot: string): Promise<DesignSystem> {
     await Promise.all([
       readPackageJson(root),
       findFirstExisting(root, TAILWIND_CONFIG_NAMES),
-      findExistingMany(root, CSS_ENTRY_CANDIDATES),
+      findCssFiles(root),
       findComponents(root),
     ]);
 
@@ -110,13 +109,22 @@ async function findFirstExisting(
   return null;
 }
 
-async function findExistingMany(root: string, candidates: string[]): Promise<string[]> {
+/**
+ * Walk src/app/styles/css for stylesheets (capped) so Tailwind v4 `@theme`
+ * blocks and token files outside the classic globals.css locations are found.
+ */
+async function findCssFiles(root: string): Promise<string[]> {
   const out: string[] = [];
-  for (const name of candidates) {
-    const full = path.join(root, name);
-    if (await exists(full)) out.push(full);
+  for (const rel of CSS_SCAN_DIRS) {
+    const dir = path.join(root, rel);
+    if (!(await exists(dir))) continue;
+    await walk(dir, async (file) => {
+      if (out.length >= CSS_FILE_LIMIT) return;
+      if (path.extname(file) === ".css") out.push(file);
+    });
+    if (out.length >= CSS_FILE_LIMIT) break;
   }
-  return out;
+  return out.sort();
 }
 
 async function findComponents(root: string): Promise<ComponentEntry[]> {
@@ -131,8 +139,17 @@ async function findComponents(root: string): Promise<ComponentEntry[]> {
       const name = path.basename(file, ext);
       if (seen.has(file)) return;
       seen.add(file);
-      const exportType = await guessExportType(file);
-      out.push({ name, filePath: file, exportType });
+      const src = await safeReadFile(file);
+      const exportType = guessExportTypeFrom(src);
+      const props = src ? extractProps(src) : undefined;
+      const variants = src ? extractVariants(src) : undefined;
+      out.push({
+        name,
+        filePath: file,
+        exportType,
+        ...(props && props.length > 0 ? { props } : {}),
+        ...(variants && Object.keys(variants).length > 0 ? { variants } : {}),
+      });
     });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
@@ -156,12 +173,106 @@ async function walk(
   );
 }
 
-async function guessExportType(file: string): Promise<ComponentEntry["exportType"]> {
-  const src = await safeReadFile(file);
+function guessExportTypeFrom(src: string | null): ComponentEntry["exportType"] {
   if (!src) return "unknown";
   if (/export\s+default\b/.test(src)) return "default";
   if (/export\s+(?:const|function|class)\s+[A-Z]/.test(src)) return "named";
   return "unknown";
+}
+
+/**
+ * Best-effort prop extraction: field names from the first
+ * `interface XxxProps { ... }` or `type XxxProps = { ... }` in the file.
+ * Regex-based by design — no TS compiler dependency, wrong on exotic types
+ * but right for the flat prop interfaces design systems actually use.
+ */
+export function extractProps(src: string): string[] {
+  const m = src.match(/(?:interface|type)\s+\w*Props\b[^{]*\{/);
+  if (!m || m.index === undefined) return [];
+  const body = readBalanced(src, m.index + m[0].length - 1);
+  if (!body) return [];
+  const props: string[] = [];
+  for (const line of body.split(/[\n;]/)) {
+    const field = line.match(/^\s*(?:readonly\s+)?([a-zA-Z_$][\w$]*)\??\s*:/);
+    if (field && field[1]) props.push(field[1]);
+  }
+  return [...new Set(props)];
+}
+
+/**
+ * Extract variant groups from cva()/tv() calls:
+ * `variants: { variant: { default: ..., outline: ... }, size: {...} }`
+ * → { variant: ["default","outline"], size: [...] }.
+ */
+export function extractVariants(src: string): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  const m = src.match(/variants\s*:\s*\{/);
+  if (!m || m.index === undefined) return out;
+  const body = readBalanced(src, m.index + m[0].length - 1);
+  if (!body) return out;
+  // Walk top-level `name: {` groups inside the variants object.
+  let depth = 0;
+  let groupName: string | null = null;
+  let groupStart = -1;
+  const nameRe = /([a-zA-Z_$][\w$]*)\s*:\s*$/;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === "{") {
+      if (depth === 0) {
+        const before = body.slice(0, i).replace(/\s+$/, "");
+        const nm = before.match(/([a-zA-Z_$][\w$]*)\s*:$/) ?? nameRe.exec(before);
+        groupName = nm?.[1] ?? null;
+        groupStart = i + 1;
+      }
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0 && groupName && groupStart !== -1) {
+        const groupBody = body.slice(groupStart, i);
+        const values = topLevelKeys(groupBody);
+        if (values.length > 0) out[groupName] = values;
+        groupName = null;
+      }
+    }
+  }
+  return out;
+}
+
+/** Keys of an object literal body, ignoring anything inside nested brackets. */
+function topLevelKeys(body: string): string[] {
+  // Blank out nested bracket contents, then match `key:` in what remains.
+  let depth = 0;
+  let flat = "";
+  for (const ch of body) {
+    if (ch === "{" || ch === "[" || ch === "(") {
+      depth++;
+      flat += " ";
+    } else if (ch === "}" || ch === "]" || ch === ")") {
+      depth--;
+      flat += " ";
+    } else {
+      flat += depth === 0 ? ch : " ";
+    }
+  }
+  const keys: string[] = [];
+  for (const m of flat.matchAll(/(?:^|[,\s])["']?([a-zA-Z_$][\w$-]*)["']?\s*:/g)) {
+    if (m[1]) keys.push(m[1]);
+  }
+  return [...new Set(keys)];
+}
+
+/** Return the content between the brace at `openIdx` and its match. */
+function readBalanced(src: string, openIdx: number): string | null {
+  if (src[openIdx] !== "{") return null;
+  let depth = 0;
+  for (let i = openIdx; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      depth--;
+      if (depth === 0) return src.slice(openIdx + 1, i);
+    }
+  }
+  return null;
 }
 
 async function collectCustomProperties(
