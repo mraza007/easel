@@ -10,10 +10,12 @@ import {
 } from "react";
 import type { PaperNode } from "../types";
 import { sendMutation } from "../ws/client";
+import { ComponentFrame } from "./ComponentFrame";
 
 interface Props {
   node: PaperNode;
-  onSelect: (id: string) => void;
+  /** additive = shift-click: add/remove from the multi-selection. */
+  onSelect: (id: string, additive: boolean) => void;
 }
 
 const VOID_TAGS = new Set([
@@ -40,6 +42,13 @@ const VOID_TAGS = new Set([
  * double-click via contentEditable. Edits are committed on blur or Enter.
  */
 export function NodeRenderer({ node, onSelect }: Props) {
+  if (node.tag === "component") {
+    return <ComponentFrame node={node} onSelect={onSelect} />;
+  }
+  return <ElementNode node={node} onSelect={onSelect} />;
+}
+
+function ElementNode({ node, onSelect }: Props) {
   const [editing, setEditing] = useState(false);
   const elRef = useRef<HTMLElement | null>(null);
   const isEditableLeaf =
@@ -60,7 +69,7 @@ export function NodeRenderer({ node, onSelect }: Props) {
   const handleClick = (e: MouseEvent) => {
     if (editing) return;
     e.stopPropagation();
-    onSelect(node.id);
+    onSelect(node.id, e.shiftKey);
   };
 
   const handleDoubleClick = (e: MouseEvent) => {

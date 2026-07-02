@@ -12,6 +12,9 @@ import { useCanvas } from "../store";
 import { NodeRenderer } from "./NodeRenderer";
 import { CanvasToolbar } from "./CanvasToolbar";
 import { SelectionOverlay } from "./SelectionOverlay";
+import { InsertPalette } from "./InsertPalette";
+import { CommentPins } from "./CommentPins";
+import { sendMutation } from "../ws/client";
 
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
@@ -25,6 +28,27 @@ export function Canvas() {
   const setPan = useCanvas((s) => s.setPan);
   const setZoom = useCanvas((s) => s.setZoom);
   const setSelected = useCanvas((s) => s.setSelected);
+  const toggleSelected = useCanvas((s) => s.toggleSelected);
+  const insertOpen = useCanvas((s) => s.insertOpen);
+  const setInsertOpen = useCanvas((s) => s.setInsertOpen);
+  const moveArtboardLocal = useCanvas((s) => s.moveArtboardLocal);
+
+  // In-flight artboard move: pointer start, artboard origin, latest position.
+  const moveRef = useRef<{
+    id: string;
+    startX: number;
+    startY: number;
+    origX: number;
+    origY: number;
+    curX: number;
+    curY: number;
+    w: number;
+    h: number;
+    moved: boolean;
+  } | null>(null);
+
+  // Active snap guide lines (world coords), rendered during a drag.
+  const [guides, setGuides] = useState<{ axis: "v" | "h"; pos: number }[]>([]);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -117,7 +141,113 @@ export function Canvas() {
 
   const handleArtboardClick = (id: string) => (e: MouseEvent) => {
     e.stopPropagation();
-    setSelected(id);
+    if (e.shiftKey) toggleSelected(id);
+    else setSelected(id);
+  };
+
+  const handleNodeSelect = (id: string, additive: boolean) => {
+    if (additive) toggleSelected(id);
+    else setSelected(id);
+  };
+
+  /**
+   * Drag-to-move an artboard. Starts on the artboard surface or its label —
+   * not on child nodes, so content clicks still select content. Position
+   * updates optimistically during the drag; the server mutation (one undo
+   * entry) is sent on release.
+   */
+  const handleArtboardPointerDown =
+    (ab: { id: string; x: number; y: number }) =>
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement;
+      const surface = e.currentTarget as HTMLElement;
+      // Child node under the pointer? Let selection/edit handle it.
+      const hit = target.closest("[data-easel-id]");
+      if (hit && hit !== surface && !target.closest(".artboard-label")) return;
+      e.stopPropagation();
+      const full = artboards.find((a) => a.id === ab.id);
+      moveRef.current = {
+        id: ab.id,
+        startX: e.clientX,
+        startY: e.clientY,
+        origX: ab.x,
+        origY: ab.y,
+        curX: ab.x,
+        curY: ab.y,
+        w: parseFloat(String(full?.styles?.width ?? "1200")) || 1200,
+        h: parseFloat(String(full?.styles?.height ?? "720")) || 720,
+        moved: false,
+      };
+      surface.setPointerCapture(e.pointerId);
+    };
+
+  const handleArtboardPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const m = moveRef.current;
+    if (!m) return;
+    const dx = (e.clientX - m.startX) / zoom;
+    const dy = (e.clientY - m.startY) / zoom;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) m.moved = true;
+    if (!m.moved) return;
+    let nx = Math.round(m.origX + dx);
+    let ny = Math.round(m.origY + dy);
+
+    // Snap dragged edges to other artboards' edges. Threshold is constant
+    // on screen (8px) so snapping doesn't get sticky when zoomed out.
+    const threshold = 8 / zoom;
+    const nextGuides: { axis: "v" | "h"; pos: number }[] = [];
+    let bestV: { delta: number; pos: number; adjusted: number } | null = null;
+    let bestH: { delta: number; pos: number; adjusted: number } | null = null;
+    for (const other of artboards) {
+      if (other.id === m.id) continue;
+      const ow = parseFloat(String(other.styles?.width ?? "1200")) || 1200;
+      const oh = parseFloat(String(other.styles?.height ?? "720")) || 720;
+      for (const edge of [other.x, other.x + ow]) {
+        for (const [mine, offset] of [
+          [nx, 0],
+          [nx + m.w, -m.w],
+        ] as const) {
+          const delta = Math.abs(mine - edge);
+          if (delta < threshold && (!bestV || delta < bestV.delta)) {
+            bestV = { delta, pos: edge, adjusted: edge + offset };
+          }
+        }
+      }
+      for (const edge of [other.y, other.y + oh]) {
+        for (const [mine, offset] of [
+          [ny, 0],
+          [ny + m.h, -m.h],
+        ] as const) {
+          const delta = Math.abs(mine - edge);
+          if (delta < threshold && (!bestH || delta < bestH.delta)) {
+            bestH = { delta, pos: edge, adjusted: edge + offset };
+          }
+        }
+      }
+    }
+    if (bestV) {
+      nx = bestV.adjusted;
+      nextGuides.push({ axis: "v", pos: bestV.pos });
+    }
+    if (bestH) {
+      ny = bestH.adjusted;
+      nextGuides.push({ axis: "h", pos: bestH.pos });
+    }
+    setGuides(nextGuides);
+
+    m.curX = nx;
+    m.curY = ny;
+    moveArtboardLocal(m.id, nx, ny);
+  };
+
+  const handleArtboardPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const m = moveRef.current;
+    if (!m) return;
+    moveRef.current = null;
+    setGuides([]);
+    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    if (m.moved) {
+      sendMutation("move-artboard", { nodeId: m.id, x: m.curX, y: m.curY });
+    }
   };
 
   return (
@@ -139,16 +269,33 @@ export function Canvas() {
             style={{ left: ab.x, top: ab.y, ...(ab.styles ?? {}) }}
             data-easel-id={ab.id}
             onClick={handleArtboardClick(ab.id)}
+            onPointerDown={handleArtboardPointerDown(ab)}
+            onPointerMove={handleArtboardPointerMove}
+            onPointerUp={handleArtboardPointerUp}
+            onPointerCancel={handleArtboardPointerUp}
           >
             {ab.layerName && <div className="artboard-label">{ab.layerName}</div>}
             {ab.children?.map((c) => (
-              <NodeRenderer key={c.id} node={c} onSelect={setSelected} />
+              <NodeRenderer key={c.id} node={c} onSelect={handleNodeSelect} />
             ))}
           </div>
         ))}
+        {guides.map((g, i) => (
+          <div
+            key={i}
+            className="snap-guide"
+            style={
+              g.axis === "v"
+                ? { left: g.pos, top: -5000, width: 1 / zoom, height: 10000 }
+                : { top: g.pos, left: -5000, height: 1 / zoom, width: 10000 }
+            }
+          />
+        ))}
         <SelectionOverlay />
+        <CommentPins />
       </div>
       <CanvasToolbar />
+      {insertOpen && <InsertPalette onClose={() => setInsertOpen(false)} />}
     </div>
   );
 }

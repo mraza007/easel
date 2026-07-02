@@ -24,6 +24,15 @@ export interface Artboard extends PaperNode {
 
 export type ConnectionStatus = "disconnected" | "connecting" | "connected";
 
+export interface CanvasComment {
+  id: string;
+  nodeId: string;
+  author: "agent" | "user";
+  text: string;
+  createdAt: number;
+  resolved?: boolean;
+}
+
 export interface ServerInfo {
   pid: number;
   startedAt: number;

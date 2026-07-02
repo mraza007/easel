@@ -7,6 +7,7 @@ import {
   type MouseEvent,
 } from "react";
 import { useCanvas } from "../store";
+import { DesignSystemSection } from "./DesignSystemSection";
 import type { PaperNode } from "../types";
 import { ChevronDownIcon, iconForTag, PlusIcon } from "./icons";
 import { sendMutation } from "../ws/client";
@@ -45,17 +46,7 @@ export function Sidebar() {
         </div>
       </section>
 
-      <section className="sidebar-section">
-        <header className="section-header">
-          <span>Design system</span>
-          <span className="count">scan</span>
-        </header>
-        <div className="empty-state">
-          <strong>Auto-detected from project root</strong>
-          Tokens and components from your repo will land here once Easel is run
-          inside a project. Set <code>EASEL_PROJECT_ROOT</code> to point at one.
-        </div>
-      </section>
+      <DesignSystemSection />
     </aside>
   );
 }
@@ -100,6 +91,28 @@ function Layer({ node, depth, isArtboard = false }: LayerProps) {
             {showTagAside && node.layerName && <span className="tag">{node.tag}</span>}
           </span>
         )}
+        <span className="layer-reorder">
+          <button
+            className="header-icon-btn"
+            title="Move earlier among siblings"
+            onClick={(e) => {
+              e.stopPropagation();
+              sendMutation("reorder-node", { nodeId: node.id, direction: -1 });
+            }}
+          >
+            ↑
+          </button>
+          <button
+            className="header-icon-btn"
+            title="Move later among siblings"
+            onClick={(e) => {
+              e.stopPropagation();
+              sendMutation("reorder-node", { nodeId: node.id, direction: 1 });
+            }}
+          >
+            ↓
+          </button>
+        </span>
       </div>
       {node.children?.map((c) => (
         <Layer key={c.id} node={c} depth={depth + 1} />

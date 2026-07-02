@@ -2,8 +2,15 @@ import { useCanvas } from "../store";
 import type { Artboard } from "../types";
 import { dispatch } from "../rpc/handlers";
 
-const WS_URL = "ws://localhost:7777";
+// The bridge binds the first free port in 7777-7786 (it may not get 7777 if
+// another agent's MCP server got there first). Probe the range: on a failed
+// attempt, advance to the next candidate before retrying.
+const WS_PORT_START = 7777;
+const WS_PORT_RANGE = 10;
 const RETRY_MS = 1500;
+
+let portOffset = 0;
+const wsUrl = () => `ws://127.0.0.1:${WS_PORT_START + portOffset}`;
 
 /** Active socket, exposed so callers can send mutations without re-plumbing. */
 let activeWs: WebSocket | null = null;
@@ -23,6 +30,14 @@ export type MutationOp =
   | "set-document-name"
   | "create-artboard"
   | "duplicate-artboard"
+  | "move-artboard"
+  | "insert-html"
+  | "reorder-node"
+  | "add-comment"
+  | "resolve-comment"
+  | "delete-comment"
+  | "undo"
+  | "redo"
   | "reload-state"
   | "reset-canvas";
 
@@ -66,12 +81,64 @@ interface ServerInfoMessage {
   payload: import("../types").ServerInfo;
 }
 
+interface DesignSystemMessage {
+  type: "design-system";
+  payload: import("../store").DesignSystemSummary | null;
+}
+
+interface CommentsMessage {
+  type: "comments";
+  payload: import("../types").CanvasComment[];
+}
+
+interface BundleMessage {
+  type: "bundle";
+  id: string;
+  ok: boolean;
+  js?: string;
+  error?: string;
+}
+
+export interface BundleResult {
+  ok: boolean;
+  js?: string;
+  error?: string;
+}
+
+let bundleCounter = 0;
+const pendingBundles = new Map<string, (r: BundleResult) => void>();
+
+/**
+ * Ask the MCP server to bundle a project component for sandbox rendering.
+ * Resolves {ok:false} rather than rejecting so callers render a fallback chip.
+ */
+export function requestBundle(
+  component: string,
+  props: Record<string, unknown>,
+): Promise<BundleResult> {
+  if (!activeWs || activeWs.readyState !== WebSocket.OPEN) {
+    return Promise.resolve({ ok: false, error: "not connected" });
+  }
+  bundleCounter += 1;
+  const id = `b-${bundleCounter}`;
+  return new Promise((resolve) => {
+    pendingBundles.set(id, resolve);
+    activeWs!.send(JSON.stringify({ type: "get-bundle", id, component, props }));
+    window.setTimeout(() => {
+      if (pendingBundles.delete(id)) resolve({ ok: false, error: "bundle timeout" });
+    }, 20000);
+  });
+}
+
 type ServerMessage =
   | StateMessage
   | RpcRequestMessage
   | SetSelectionMessage
   | MetadataMessage
-  | ServerInfoMessage;
+  | ServerInfoMessage
+  | DesignSystemMessage
+  | CommentsMessage
+  | BundleMessage;
 
 /**
  * Connects to the MCP server's WebSocket bridge.
@@ -103,10 +170,12 @@ export function connectMcp(): () => void {
   const open = () => {
     if (disposed) return;
     useCanvas.getState().setConnection("connecting");
-    ws = new WebSocket(WS_URL);
+    ws = new WebSocket(wsUrl());
     activeWs = ws;
+    let opened = false;
 
     ws.addEventListener("open", () => {
+      opened = true;
       useCanvas.getState().setConnection("connected");
       // Send current selection so the server is in sync.
       const id = useCanvas.getState().selectedId;
@@ -144,6 +213,22 @@ export function connectMcp(): () => void {
         useCanvas.getState().setServerInfo(msg.payload);
         return;
       }
+      if (msg.type === "design-system") {
+        useCanvas.getState().setDesignSystem(msg.payload);
+        return;
+      }
+      if (msg.type === "comments") {
+        useCanvas.getState().setComments(msg.payload);
+        return;
+      }
+      if (msg.type === "bundle") {
+        const resolve = pendingBundles.get(msg.id);
+        if (resolve) {
+          pendingBundles.delete(msg.id);
+          resolve({ ok: msg.ok, js: msg.js, error: msg.error });
+        }
+        return;
+      }
       if (msg.type === "rpc") {
         await handleRpc(ws!, msg);
         return;
@@ -153,6 +238,8 @@ export function connectMcp(): () => void {
     ws.addEventListener("close", () => {
       useCanvas.getState().setConnection("disconnected");
       if (activeWs === ws) activeWs = null;
+      // Never connected on this port — try the next one in the bridge's range.
+      if (!opened) portOffset = (portOffset + 1) % WS_PORT_RANGE;
       if (!disposed) retryTimer = window.setTimeout(open, RETRY_MS);
     });
 

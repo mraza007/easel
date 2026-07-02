@@ -1,12 +1,15 @@
 import { useEffect, useRef } from "react";
 import { Topbar } from "./ui/Topbar";
 import { Sidebar } from "./ui/Sidebar";
+import { Inspector } from "./ui/Inspector";
 import { Canvas } from "./canvas/Canvas";
 import { useCanvas } from "./store";
 import { connectMcp, sendMutation } from "./ws/client";
+import { fitView } from "./canvas/fitView";
 
 export function App() {
   const artboards = useCanvas((s) => s.artboards);
+  const designSystem = useCanvas((s) => s.designSystem);
   const setPan = useCanvas((s) => s.setPan);
   const setZoom = useCanvas((s) => s.setZoom);
   const fitDoneRef = useRef(false);
@@ -15,6 +18,21 @@ export function App() {
     const dispose = connectMcp();
     return dispose;
   }, []);
+
+  // Inject the project's CSS custom properties into :root so designs using
+  // var(--token) — via apply_token or agent-authored HTML — actually resolve.
+  useEffect(() => {
+    const props = designSystem?.customProperties;
+    if (!props || Object.keys(props).length === 0) return;
+    const style = document.createElement("style");
+    style.setAttribute("data-easel-tokens", "");
+    const decls = Object.entries(props)
+      .map(([k, v]) => `--${k}: ${v};`)
+      .join("\n  ");
+    style.textContent = `:root {\n  ${decls}\n}`;
+    document.head.appendChild(style);
+    return () => style.remove();
+  }, [designSystem]);
 
   // Auto-fit-to-view once we have artboards and the layout has settled.
   useEffect(() => {
@@ -75,19 +93,56 @@ export function App() {
         }
       }
 
-      const { selectedId, setSelected } = useCanvas.getState();
+      const { selectedId, selectedIds, setSelected } = useCanvas.getState();
 
       if (e.key === "Escape") {
         if (selectedId) setSelected(null);
         return;
       }
 
-      if (e.key === "Delete" || e.key === "Backspace") {
-        if (!selectedId) return;
+      // Cmd/Ctrl + Z: undo. With Shift: redo.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
-        sendMutation("delete-node", { nodeId: selectedId });
+        sendMutation(e.shiftKey ? "redo" : "undo", {});
+        return;
+      }
+
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedIds.length === 0) return;
+        e.preventDefault();
+        for (const id of selectedIds) {
+          sendMutation("delete-node", { nodeId: id });
+        }
         setSelected(null);
         return;
+      }
+
+      // I: toggle the insert palette.
+      if (e.key.toLowerCase() === "i" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        const { insertOpen, setInsertOpen } = useCanvas.getState();
+        setInsertOpen(!insertOpen);
+        return;
+      }
+
+      // Shift+1: fit all artboards. Shift+2: fit selection.
+      if (e.shiftKey && (e.key === "1" || e.key === "2" || e.key === "!" || e.key === "@")) {
+        e.preventDefault();
+        fitView(e.key === "2" || e.key === "@" ? selectedId : null);
+        return;
+      }
+
+      // Arrow keys: nudge the selected artboard (Shift = 10px).
+      if (e.key.startsWith("Arrow") && selectedId) {
+        const ab = useCanvas.getState().artboards.find((a) => a.id === selectedId);
+        if (ab) {
+          e.preventDefault();
+          const step = e.shiftKey ? 10 : 1;
+          const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+          const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+          sendMutation("move-artboard", { nodeId: ab.id, x: ab.x + dx, y: ab.y + dy });
+          return;
+        }
       }
 
       // Cmd/Ctrl + D: duplicate selected artboard.
@@ -112,6 +167,7 @@ export function App() {
       <div className="workspace">
         <Sidebar />
         <Canvas />
+        <Inspector />
       </div>
     </div>
   );
